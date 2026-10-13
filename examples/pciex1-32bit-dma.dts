@@ -1,0 +1,22 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Experimental external PCIe DMA-range overlay for Pi 5.
+ * Taken from publicly documented community experiments, not an official
+ * or universally verified FireWire fix.
+ * See https://github.com/raspberrypi/linux/issues/7317
+ * Check current kernel/firmware device tree compatibility before using.
+ */
+/ {
+    compatible = "brcm,bcm2712";
+
+    fragment@0 {
+        target = <&pciex1>;
+        __overlay__ {
+            #address-cells = <0x03>;
+            #size-cells = <0x02>;
+            dma-ranges = <0x03000000 0x00 0x00 0x00 0x00 0x00 0x80000000>;
+        };
+    };
+};

@@ -1,0 +1,6 @@
+# Install in a virtual environment on Raspberry Pi OS 64-bit.
+# Prefer a venv created with --system-site-packages if using apt-provided
+# gpiozero/lgpio packages. See INSTALL.md.
+Pillow>=10
+luma.lcd>=2
+spidev>=3.5
