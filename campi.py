@@ -21,8 +21,17 @@ from PIL import Image, ImageDraw, ImageFont
 from luma.core.interface.serial import spi
 from luma.lcd.device import ili9341
 
-APP_VERSION = "1.0"
-# CamPi v1.0
+APP_VERSION = "1.01"
+# CamPi v1.01
+# Patch notes (v1.01, 2026-10-15):
+# - Prevent HOME interface stalls: network, storage and analog checks run
+#   in background workers with status cached for display.
+# - Probe analog modes, controls and audio on USB connection or manual refresh,
+#   not continuously or when starting recording.
+# - Limit storage status refresh to 30s idle / 60s recording. Perform fresh
+#   destination checks when REC is pressed or storage info is explicitly opened.
+# - Retain existing DV/HDV FireWire probe shutdown and capture protections.
+
 # Raspberry Pi 5 capture appliance for live DV/HDV, FireWire tape transport,
 # and generic USB analog capture. Masters are recorded natively/losslessly.
 # UI themes: Basic, Genuine Sorny, Genuine Panafonics and Genuine JayVC,
@@ -169,6 +178,11 @@ DEFAULT_SETTINGS = {
 ANALOG_VIDEO_DEVICE = os.environ.get("CAMPI_ANALOG_VIDEO_FALLBACK", "/dev/video0")
 ANALOG_AUDIO_FALLBACK = os.environ.get("CAMPI_ANALOG_AUDIO_FALLBACK", "plughw:2,0")
 ANALOG_PRE_CAPTURE_DELAY = 1.0
+
+# Lightweight storage status updates: 30s idle, 60s while recording.
+# Intentional REC and explicit status checks may force a fresh read.
+STORAGE_REFRESH_IDLE_SECONDS = 30.0
+STORAGE_REFRESH_RECORDING_SECONDS = 60.0
 
 # ============================================================
 # UI COLOURS / FONTS
@@ -1420,6 +1434,10 @@ class TapelessUI:
         self.hdmi_detect_checked = 0.0
         self.external_storage_cache = None
         self.external_storage_checked = 0.0
+        # HOME never waits for lsblk/statvfs; use a worker-owned storage snapshot.
+        self.home_storage_cache = ("INTERNAL", None)
+        self.home_storage_checked = 0.0
+        self.home_storage_thread = None
 
         self.info_title = "INFO"
         self.info_lines = []
@@ -1453,7 +1471,14 @@ class TapelessUI:
         self.analog_capture_candidates = []
         self.analog_audio_device = None
         self.analog_audio_name = ""
+        self.analog_audio_checked = False
         self.analog_driver_standards = []
+        # One-time capability discovery on initial USB presence/reconnection.
+        # Subsequent rendering uses cached information.
+        self.analog_hotplug_signature = None
+        self.analog_hotplug_checked = 0.0
+        self.analog_refresh_thread = None
+        self.analog_hotplug_thread = None
 
         # Network status is cached so the header can update live without
         # spawning nmcli on every 20 Hz render pass.
@@ -1469,6 +1494,7 @@ class TapelessUI:
             "nmcli": shutil.which("nmcli") is not None,
         }
         self.network_checked = 0.0
+        self.network_refresh_thread = None
         self.network_return_page = "system"
         # Power can be opened from System settings or directly from the HOME
         # CamPi header. BACK returns to whichever page launched the power menu.
@@ -1485,9 +1511,8 @@ class TapelessUI:
         self.keyboard_symbols = False
         self.keyboard_index = 0
 
-        self.refresh_analog_capabilities(force=True)
-        self.validate_selected_analog_mode(save=False)
-        self.apply_saved_analog_controls()
+        # Do not run V4L2/ALSA queries synchronously during UI startup.
+        # The main loop schedules first discovery via poll_analog_hotplug().
 
     # --------------------------------------------------------
     # SETTINGS
@@ -1583,6 +1608,7 @@ class TapelessUI:
         next_policy = order[(order.index(current) + 1) % len(order)]
         self.settings["storage_policy"] = next_policy
         self.external_storage_checked = 0.0
+        self.home_storage_checked = 0.0
         self.save_settings()
         self.show_message(storage_policy_label(next_policy), 1.8)
         self.refresh_hdmi_holding(force=True)
@@ -2395,8 +2421,9 @@ class TapelessUI:
     def selected_source_available(self):
         if self.capture_mode == "dv":
             return shutil.which("dvgrab") is not None and self.firewire_camera_available()
-        device = self.discover_analog_video_device()
-        return bool(device and os.path.exists(device))
+        # HOME only needs the cached device's presence. Never run v4l2-ctl,
+        # enumerate formats, or query audio from the display thread.
+        return bool(self.analog_video_device and os.path.exists(self.analog_video_device))
 
     def selected_source_offline_text(self):
         if self.capture_mode != "dv":
@@ -2418,6 +2445,97 @@ class TapelessUI:
     # --------------------------------------------------------
     # ANALOG CAPABILITIES / SETTINGS
     # --------------------------------------------------------
+
+    def _analog_device_signature(self):
+        """Fast filesystem-only USB hotplug signature; no device IOCTLs."""
+        result = []
+        for node in sorted(Path("/dev").glob("video[0-9]*")):
+            try:
+                stat = node.stat()
+                parent = (Path("/sys/class/video4linux") / node.name / "device").resolve()
+                # Node creation time distinguishes unplug/replug where Linux
+                # assigns the same /dev/video number and physical USB port.
+                result.append((node.name, stat.st_rdev, stat.st_ctime_ns, str(parent)))
+            except OSError:
+                continue
+        return tuple(result)
+
+
+    def _clear_analog_device(self):
+        """Discard stale device-specific information after USB removal."""
+        self.analog_video_device = None
+        self.analog_device_name = ""
+        self.analog_device_driver = ""
+        self.analog_device_bus = ""
+        self.analog_device_vidpid = ""
+        self.analog_device_usb_root = ""
+        self.analog_capture_candidates = []
+        self.analog_modes = []
+        self.analog_controls = []
+        self.analog_driver_standards = []
+        self.analog_audio_device = None
+        self.analog_audio_name = ""
+        self.analog_audio_checked = False
+
+
+    def request_analog_refresh(self):
+        """Probe a newly attached dongle asynchronously, or refresh manually."""
+        if self.recording:
+            return False
+        if self.analog_refresh_thread and self.analog_refresh_thread.is_alive():
+            return False
+
+        def worker():
+            try:
+                device = self.discover_analog_video_device(force=True)
+                if device:
+                    # Discovery has already collected the advertised modes.
+                    # Do not request --list-formats-ext a second time.
+                    self.refresh_analog_capabilities(force=True)
+                    self.validate_selected_analog_mode(save=True)
+                    self.apply_saved_analog_controls()
+                else:
+                    self._clear_analog_device()
+            except Exception as exc:
+                # A broken capture driver must never terminate the UI.
+                print("Analog detection failed:", exc)
+
+        self.analog_refresh_thread = threading.Thread(target=worker, daemon=True)
+        self.analog_refresh_thread.start()
+        return True
+
+
+    def poll_analog_hotplug(self):
+        """Schedule a filesystem-only USB presence check outside the UI thread."""
+        if self.recording:
+            return
+        now = time.monotonic()
+        if now - self.analog_hotplug_checked < 1.5:
+            return
+        if self.analog_hotplug_thread and self.analog_hotplug_thread.is_alive():
+            return
+        self.analog_hotplug_checked = now
+
+        def worker():
+            try:
+                signature = self._analog_device_signature()
+                if signature == self.analog_hotplug_signature or self.recording:
+                    return
+                if self.analog_refresh_thread and self.analog_refresh_thread.is_alive():
+                    return
+                self.analog_hotplug_signature = signature
+                if not signature:
+                    self._clear_analog_device()
+                    return
+                if self.analog_video_device and not os.path.exists(self.analog_video_device):
+                    self._clear_analog_device()
+                self.request_analog_refresh()
+            except Exception as exc:
+                print("Analog hotplug check failed:", exc)
+
+        self.analog_hotplug_thread = threading.Thread(target=worker, daemon=True)
+        self.analog_hotplug_thread.start()
+
 
     @staticmethod
     def _sysfs_text(path):
@@ -2552,17 +2670,12 @@ class TapelessUI:
         return score
 
     def discover_analog_video_device(self, force=False):
-        """Auto-select a usable USB V4L2 capture node, preferring analog-like modes."""
-        now = time.monotonic()
-        if (
-            not force
-            and now - self.analog_device_checked < 2.0
-            and self.analog_video_device
-            and os.path.exists(self.analog_video_device)
-        ):
-            return self.analog_video_device
+        """Return cached video device; full discovery is worker-only."""
+        if not force:
+            device = self.analog_video_device
+            return device if device and os.path.exists(device) else None
 
-        self.analog_device_checked = now
+        self.analog_device_checked = time.monotonic()
         candidates = []
 
         def node_sort(path):
@@ -2608,6 +2721,7 @@ class TapelessUI:
             self.analog_device_usb_root = ""
             self.analog_audio_device = None
             self.analog_audio_name = ""
+            self.analog_audio_checked = False
             if changed:
                 self.analog_modes = []
                 self.analog_controls = []
@@ -2627,6 +2741,7 @@ class TapelessUI:
         if changed:
             self.analog_audio_device = None
             self.analog_audio_name = ""
+            self.analog_audio_checked = False
             self.analog_controls = []
             self.analog_driver_standards = []
 
@@ -2699,22 +2814,21 @@ class TapelessUI:
         return False
 
     def refresh_analog_capabilities(self, force=False):
-        now = time.monotonic()
-        if not force and now - self.analog_caps_checked < 5.0:
+        # Routine UI/menu refreshes use previously discovered capabilities.
+        # Only the hotplug worker calls this with force=True.
+        if not force:
             return
-        self.analog_caps_checked = now
+        self.analog_caps_checked = time.monotonic()
 
-        device = self.discover_analog_video_device(force=force)
+        device = self.discover_analog_video_device()
         if not device:
             self.analog_modes = []
             self.analog_controls = []
             self.analog_driver_standards = []
             return
 
-        modes = self._probe_v4l2_modes(device)
-        if modes:
-            self.analog_modes = modes
-
+        # discover_analog_video_device(force=True) populated analog_modes;
+        # do not issue another format enumeration on the same connection.
         try:
             result = subprocess.run(
                 ["v4l2-ctl", "-d", device, "--list-ctrls-menus"],
@@ -2893,9 +3007,7 @@ class TapelessUI:
         if standard not in ("PAL", "NTSC"):
             return
         self.settings["analog_standard"] = standard
-        self.discover_analog_video_device(force=True)
         self._apply_driver_analog_standard(standard)
-        self.refresh_analog_capabilities(force=True)
         self.set_selected_analog_mode(self.best_mode_for_standard(standard), save=False)
         self.save_settings()
 
@@ -2949,7 +3061,6 @@ class TapelessUI:
             self.set_analog_control(control["name"], control["default"], persist=False)
         self.settings["analog_controls"] = {}
         self.save_settings()
-        self.refresh_analog_capabilities(force=True)
 
     # --------------------------------------------------------
     # STORAGE
@@ -2958,10 +3069,12 @@ class TapelessUI:
     def external_storage_info(self, force=False):
         """Discover mounted or present USB block storage without polling lsblk every frame."""
         now = time.monotonic()
+        interval = (STORAGE_REFRESH_RECORDING_SECONDS if self.recording
+                    else STORAGE_REFRESH_IDLE_SECONDS)
         if (
             not force
             and self.external_storage_cache is not None
-            and now - self.external_storage_checked < 2.0
+            and now - self.external_storage_checked < interval
         ):
             return dict(self.external_storage_cache)
 
@@ -3070,6 +3183,31 @@ class TapelessUI:
     def ssd_available(self):
         info = self.external_storage_info()
         return bool(info.get("mounted") and info.get("writable") and info.get("mountpoint"))
+
+    def home_storage_status(self):
+        """Display a cached storage snapshot; disk probes never run on HOME."""
+        now = time.monotonic()
+        interval = (STORAGE_REFRESH_RECORDING_SECONDS if self.recording
+                    else STORAGE_REFRESH_IDLE_SECONDS)
+        if (
+            now - self.home_storage_checked >= interval
+            and not (self.home_storage_thread and self.home_storage_thread.is_alive())
+        ):
+            self.home_storage_checked = now
+
+            def worker():
+                try:
+                    # Resolve USB mounting and free space together off-thread.
+                    self.external_storage_info(force=True)
+                    name, _path, free_gb = self.storage()
+                    self.home_storage_cache = (name, free_gb)
+                except Exception as exc:
+                    print("Storage status refresh failed:", exc)
+
+            self.home_storage_thread = threading.Thread(target=worker, daemon=True)
+            self.home_storage_thread.start()
+        return self.home_storage_cache
+
 
     def storage(self):
         external = self.external_storage_info()
@@ -3182,7 +3320,6 @@ class TapelessUI:
             ]
 
         if self.page == "analog_settings":
-            self.refresh_analog_capabilities()
             self.validate_selected_analog_mode(save=True)
             mode = self.selected_analog_mode()
             return [
@@ -3193,7 +3330,6 @@ class TapelessUI:
             ]
 
         if self.page == "analog_modes":
-            self.refresh_analog_capabilities()
             if not self.analog_modes:
                 return [("No video modes detected", "noop"), ("Refresh", "refresh_analog")]
             current_key = self.analog_mode_key(self.selected_analog_mode())
@@ -3205,7 +3341,6 @@ class TapelessUI:
             return items
 
         if self.page == "analog_picture":
-            self.refresh_analog_capabilities()
             if not self.analog_controls:
                 return [("No adjustable controls", "noop"), ("Refresh", "refresh_analog")]
             items = []
@@ -4299,14 +4434,12 @@ class TapelessUI:
                 self.goto("home")
                 self.refresh_hdmi_holding(force=True)
             elif action == "analog_settings":
-                self.refresh_analog_capabilities(force=True)
                 self.validate_selected_analog_mode(save=True)
                 self.goto("analog_settings")
             return
 
         if self.page == "analog_settings":
             if action == "analog_modes":
-                self.refresh_analog_capabilities(force=True)
                 self.goto("analog_modes")
                 current_key = self.analog_mode_key(self.selected_analog_mode())
                 for index, mode in enumerate(self.analog_modes):
@@ -4315,7 +4448,6 @@ class TapelessUI:
                         break
                 self.ensure_selection_visible()
             elif action == "analog_picture":
-                self.refresh_analog_capabilities(force=True)
                 self.goto("analog_picture")
             elif action == "analog_caps":
                 self.open_analog_capabilities()
@@ -4327,9 +4459,8 @@ class TapelessUI:
             if action == "noop":
                 return
             if action == "refresh_analog":
-                self.refresh_analog_capabilities(force=True)
-                self.validate_selected_analog_mode(save=True)
-                self.show_message("Video modes refreshed")
+                self.request_analog_refresh()
+                self.show_message("Refreshing video modes")
                 self.goto("analog_modes")
                 return
             if action.startswith("analog_mode::"):
@@ -4347,8 +4478,7 @@ class TapelessUI:
             if action == "noop":
                 return
             if action == "refresh_analog":
-                self.refresh_analog_capabilities(force=True)
-                self.apply_saved_analog_controls()
+                self.request_analog_refresh()
                 self.goto("analog_picture")
                 return
             if action == "reset_picture":
@@ -4560,11 +4690,10 @@ class TapelessUI:
             self.show_message("Control update failed", 2.5)
 
     def open_analog_capabilities(self):
-        self.refresh_analog_capabilities(force=True)
         formats = sorted({mode["pixel_format"] for mode in self.analog_modes})
         mode = self.selected_analog_mode()
         device = self.analog_video_device
-        audio_device = self.find_analog_audio_device(force=True)
+        audio_device = self.find_analog_audio_device()
 
         device_label = self.analog_device_name or (Path(device).name if device else "none")
         if self.analog_device_vidpid:
@@ -4604,7 +4733,6 @@ class TapelessUI:
 
     def confirm_reset_analog(self):
         def do_reset():
-            self.refresh_analog_capabilities(force=True)
             self.set_selected_analog_mode(self.best_reported_analog_mode(), save=False)
             self.reset_analog_controls()
             self.save_settings()
@@ -4820,7 +4948,10 @@ class TapelessUI:
             self.show_error("FireWire detection still stopping", 3.5)
             return False
 
-        storage_name, capture_dir, _free_gb = self.storage()
+        storage_name, capture_dir, free_gb = self.storage()
+        # Reuse this free-space reading for the Tape Deck footer, not per frame.
+        self.home_storage_cache = (storage_name, free_gb)
+        self.home_storage_checked = time.monotonic()
         try:
             Path(capture_dir).mkdir(parents=True, exist_ok=True)
         except Exception as exc:
@@ -4970,6 +5101,7 @@ class TapelessUI:
                 self.dv_deck_recording = True
                 self.recording = True
                 self.record_started = time.monotonic()
+                self.home_storage_checked = self.record_started
                 self.capture_target = self.dv_deck_session_prefix
                 self.dv_stream_scan = ""
                 self.dv_scan_checked = 0.0
@@ -4979,6 +5111,8 @@ class TapelessUI:
                 self.dv_deck_recording = False
                 self.recording = False
                 self.record_started = None
+                # Show the final free space promptly after capture finishes.
+                self.home_storage_checked = 0.0
             elif event == "warning":
                 self._append_capture_log(detail)
             elif event == "media_status":
@@ -5105,13 +5239,18 @@ class TapelessUI:
         return devices
 
     def find_analog_audio_device(self, force=False):
-        """Pair ALSA capture audio to the selected video dongle where possible."""
-        video_device = self.discover_analog_video_device(force=force)
+        """Return cached ALSA pairing after the initial hotplug discovery."""
+        video_device = self.discover_analog_video_device()
         if not video_device:
             self.analog_audio_device = None
             self.analog_audio_name = ""
+            self.analog_audio_checked = False
             return None
+        if not force:
+            return self.analog_audio_device
 
+        # Called once by the hotplug worker after USB video discovery.
+        self.analog_audio_checked = True
         devices = self._alsa_capture_devices()
         if not devices:
             self.analog_audio_device = None
@@ -5183,7 +5322,12 @@ class TapelessUI:
         if self.recording:
             return
 
+        # REC intentionally refreshes mounts so a newly connected USB drive
+        # is selected correctly; this is not part of the display loop.
+        self.external_storage_info(force=True)
         storage_name, capture_dir, free_gb = self.storage()
+        self.home_storage_cache = (storage_name, free_gb)
+        self.home_storage_checked = time.monotonic()
 
         try:
             Path(capture_dir).mkdir(parents=True, exist_ok=True)
@@ -5258,14 +5402,16 @@ class TapelessUI:
                 self.show_error("ffmpeg is not installed", 4.0)
                 return
 
-            video_device = self.discover_analog_video_device(force=True)
+            # Use USB-connect-time discovery, not new V4L2 probing at REC.
+            if self.analog_refresh_thread and self.analog_refresh_thread.is_alive():
+                self.show_message("Analog device detecting", 2.0)
+                return
+            video_device = self.discover_analog_video_device()
             if not video_device:
                 self.show_error("Analog video device not detected", 4.0)
                 return
 
-            self.refresh_analog_capabilities(force=True)
             self.validate_selected_analog_mode(save=True)
-            self.apply_saved_analog_controls()
 
             mode = self.selected_analog_mode()
             input_format = ffmpeg_v4l2_input_format(mode["pixel_format"])
@@ -5275,7 +5421,7 @@ class TapelessUI:
             standard_label = self.analog_mode_standard_label(mode)
             standard_slug = standard_label.lower() if standard_label else "video"
             output_file = Path(capture_dir) / f"analog_{standard_slug}_{stamp}.mkv"
-            audio_device = self.find_analog_audio_device(force=True)
+            audio_device = self.find_analog_audio_device()
 
             # The selected V4L2 mode is authoritative. CamPi passes the exact
             # format, resolution and frame rate reported by the dongle to FFmpeg.
@@ -5432,6 +5578,7 @@ class TapelessUI:
         self.capture_process = None
         self.recording = False
         self.record_started = None
+        self.home_storage_checked = 0.0
         self._close_capture_log()
         self.refresh_hdmi_holding(force=True)
         self.beep_action()
@@ -5461,6 +5608,7 @@ class TapelessUI:
         if code is not None:
             self.recording = False
             self.record_started = None
+            self.home_storage_checked = 0.0
             self.capture_process = None
             self._close_capture_log()
             self.refresh_hdmi_holding(force=True)
@@ -6711,11 +6859,24 @@ class TapelessUI:
         return last
 
     def refresh_network_status(self, force=False):
+        """Return cached status immediately; refresh nmcli outside display loop."""
         now = time.monotonic()
-        if not force and now - self.network_checked < 2.0:
-            return self.network_state
-        self.network_checked = now
+        if force:
+            self.network_checked = now
+            return self._query_network_status()
+        if (
+            now - self.network_checked >= 5.0
+            and not (self.network_refresh_thread and self.network_refresh_thread.is_alive())
+        ):
+            self.network_checked = now
+            self.network_refresh_thread = threading.Thread(
+                target=self._query_network_status, daemon=True
+            )
+            self.network_refresh_thread.start()
+        return self.network_state
 
+    def _query_network_status(self):
+        """Slow NetworkManager queries. Never called from ordinary rendering."""
         state = {
             "lan_connected": False,
             "lan_iface": "",
@@ -6802,6 +6963,7 @@ class TapelessUI:
 
         self.network_state = state
         return state
+
 
     def interface_ip_addresses(self, iface):
         """Return IPv4/IPv6 addresses assigned specifically to one interface."""
@@ -7311,6 +7473,9 @@ class TapelessUI:
         return lines
 
     def open_storage_status(self):
+        # This is an explicit status request: refresh the external device list
+        # before choosing the active storage location shown on this screen.
+        self.external_storage_info(force=True)
         name, path, _free_gb = self.storage()
         lines = [
             f"Policy: {storage_policy_label(self.storage_policy)}",
@@ -7321,6 +7486,7 @@ class TapelessUI:
         self.open_info("STORAGE STATUS", lines, parent="storage")
 
     def open_device_status(self):
+        self.external_storage_info(force=True)
         name, _, _free_gb = self.storage()
         self.firewire_camera_available(force=True)
         if self.firewire_camera_present:
@@ -7329,7 +7495,7 @@ class TapelessUI:
             firewire = "Controller only"
         else:
             firewire = "Not detected"
-        analog_device = self.discover_analog_video_device(force=True)
+        analog_device = self.discover_analog_video_device()
         analog = "OK" if analog_device else "Not detected"
         touch = "OK" if self.touch_enabled else "Unavailable"
         hdmi = "Connected" if self.refresh_hdmi_detection(force=True) else "Not detected"
@@ -7861,7 +8027,7 @@ class TapelessUI:
             background=home_bg,
         )
 
-        storage_name, _, free_gb = self.storage()
+        storage_name, free_gb = self.home_storage_status()
         display_name = storage_display_name(storage_name)
         if free_gb is None:
             storage_text = f"{display_name} unavailable"
@@ -9992,7 +10158,9 @@ class TapelessUI:
         # Tape Deck intentionally has no centre footer button. Use that space
         # for a two-line storage readout instead of squeezing it above BACK.
         if self.page == "dv_tape":
-            storage_name, _, free_gb = self.storage()
+            # Never call disk_usage() on every LCD frame. HOME and Tape Deck
+            # share the same cached snapshot and background refresh schedule.
+            storage_name, free_gb = self.home_storage_status()
             display_name = storage_display_name(storage_name)
             free_text = "UNAVAILABLE" if free_gb is None else f"{free_gb:.1f} GB FREE"
             x1 = button_width + 3
@@ -10132,6 +10300,7 @@ def main():
     try:
         while True:
             ui.poll_capture()
+            ui.poll_analog_hotplug()
             now = time.monotonic()
 
             if touch is not None and calibration is not None:
