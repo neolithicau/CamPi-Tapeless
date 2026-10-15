@@ -97,7 +97,6 @@ examples/campi.env.example        Optional per-device settings
 scripts/install-service.sh        Generate and install a user-specific systemd unit
 scripts/check-system.sh           Read-only installation diagnostics
 docs/TROUBLESHOOTING.md           Common problems and commands
-docs/PORTABILITY.md               Source portability audit and test matrix
 tests/test_portability.py          Hardware-independent static tests
 examples/pciex1-32bit-dma.dts     Optional experimental DMA overlay source
 .gitignore                        Excludes local configuration, recordings and builds
