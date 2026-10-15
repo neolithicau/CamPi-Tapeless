@@ -2,13 +2,11 @@
 
 **A tapeless, touch-controlled DV/HDV and analogue-video recorder for Raspberry Pi 5.**
 
-CamPi turns a Raspberry Pi 5 into a self-contained **direct-to-edit video capture unit** for DV/HDV camcorders, DV/HDV tape decks and analog sources (including analog camcorders).
-
-Instead of requiring a chain of devices and conversion steps, this **records a native FireWire DV/HDV stream (or a USB analogue capture feed) to an SD card or attached USB storage device**, then makes the resulting files available for editing or archiving.
+CamPi turns a Raspberry Pi 5 into a self-contained **direct-to-edit video capture unit** for DV/HDV camcorders, DV/HDV tape decks and analog sources (including analog camcorders). Instead of requiring a chain of devices and conversion steps, this **directly records a native FireWire DV/HDV stream (or a USB analogue capture feed) to an SD card or attached USB storage device**, then makes the resulting files available for editing or archiving.
 
 My original build uses a **Pi 5 1gb, Raspberry Pi OS Lite 64-bit, PCIe TO MiniPCIe Adapter, a Startech PCIe-to-FireWire card (MPEX1394B3), and a 320 × 240 SPI touchscreen (Aliexpress / SHCHV 2.4inch display)**, and a little 5v buzzer on GPIO 16 (optional). My capture directories are also shared via SAMBA on any connected Wifi, but that's a seperate set of config which is out of the scope of this script.
 
-> **Status: Working and ready.** DV and HDV FireWire capture and tapedeck functions, analog captures, touchscreen and HDMI recording playback have been tested at length on my Pi5 1gb setup. I have tested this with various Amazon el-cheapo analog video adapters, and tested various types of MiniDV camera on the StarTech firewire adapter (MiniDV PAL, MiniDV NTSC and HDV units all tested). Again, if your specific device or setup doesn't work, please don't be surprised.
+> **Status: Everything works great.** DV and HDV FireWire capture and tapedeck functions, analog captures, touchscreen and HDMI recording playback have been tested at length on my Pi5 1gb setup. I have tested this with various Amazon el-cheapo analog video adapters, and tested various types of MiniDV camera on the StarTech firewire adapter (MiniDV PAL, MiniDV NTSC and HDV units all tested). Again, if your specific device or setup doesn't work, please don't be surprised.
 
 **NOTE:** This script is **not validated across multiple Pi 5s or display/card combinations**. Follow [INSTALL.md](INSTALL.md) and check the [limitations](#limitations-and-compatibility). This script is provided with absolutely zero support or warranty. I do not guarantee it will work in any instance outside my own operating environment, but I have produced it with some redundancy and fallbacks to allow it to operate in any similar environment. This script was produced entirely using ChatGPT and I make absolutely zero guarantees around anything other than my attempts at quality control - I have polished the proverbial as much as it can be polished. As a package, it works, and it works great (for me).
 
@@ -20,7 +18,7 @@ My original build uses a **Pi 5 1gb, Raspberry Pi OS Lite 64-bit, PCIe TO MiniPC
 | **Live DV capture** | Records native SD DV over IEEE 1394/FireWire using `dvgrab`, with PAL/NTSC stream identification. Outputs `.dv`. |
 | **Live HDV capture** | Detects MPEG-2 transport-stream HDV over FireWire and records native `.m2t` files using `dvgrab`. Recognises formats such as 1080i and 720p where reported by the camera. |
 | **DV/HDV Tape-deck transport** | Provides FireWire AV/C transport controls for compatible DV devices, using `dvcont` where available. Camera-dependent, and your camera should be in tape playback mode before using this. |
-| **Analogue capture** | Discovers V4L2 USB video input and matching ALSA audio input, then records **FFV1 lossless video** with **PCM audio** into `.mkv` using FFmpeg. Available modes depend on the dongle. This is a bonus feature and not a focus of the script. |
+| **Analogue capture** | Discovers V4L2 USB video input and matching ALSA audio input, then records **FFV1 lossless video** with **PCM audio** into `.mkv` using FFmpeg. Available modes depend on the dongle. This is a bonus feature and not a primary focus of the script. |
 | **Storage** | Supports internal capture storage or writable mounted USB media. Auto mode prefers USB and falls back to internal storage when USB is not available. |
 | **Touchscreen interface** | Operates on a 320 × 240 ILI9341 SPI LCD with XPT2046 resistive touchscreen, including touch calibration, menu navigation, notifications and a configurable buzzer. |
 | **HDMI playback** | Plays recordings over a detected HDMI display using mpv (recommend the port closest to USB-C power in). Includes playback, seek control, storage information and an HDMI-disconnected warning. |
@@ -72,7 +70,7 @@ CamPi uses **BCM GPIO numbers** in settings, not physical header numbers.
 
 ## Configuration
 
-CamPi keeps settings/calibration under `~/.config/tapeless/` by default for backward compatibility with older builds of the project. Recordings default to `~/captures/`. A preferred USB mount is `/mnt/usb-captures/`, but CamPi also discovers other mounted writable USB volumes through `lsblk`.
+CamPi keeps settings/calibration under `~/.config/tapeless/` by default. Recordings default to `~/captures/`. A preferred USB mount is `/mnt/usb-captures/`, but CamPi also discovers other mounted writable USB volumes through `lsblk`.
 
 Optional environment overrides are in [examples/campi.env.example](examples/campi.env.example). Examples:
 
@@ -84,7 +82,7 @@ CAMPI_INTERNAL_CAPTURE_DIR=/home/myuser/captures
 CAMPI_USB_CAPTURE_DIR=/mnt/usb-captures
 ```
 
-The sample service loads overrides from `/etc/campi/campi.env` if present. **Never commit a live settings file, Wi-Fi passwords, personal recordings or private logs to the repository.**
+The sample service loads overrides from `/etc/campi/campi.env` if present.
 
 ## Project layout
 
@@ -110,9 +108,10 @@ examples/pciex1-32bit-dma.dts     Optional experimental DMA overlay source
 - Touch calibration is required on the first run. The LCD is not a generic HDMI/DSI framebuffer UI.
 - The tape-deck controller is designed for **compatible DV AV/C transport**, not guaranteed for every HDV deck/camera. You should put your camera in tape playback mode before using this feature.
 - USB analogue capture requires a V4L2 device and typically an ALSA input. Pixel formats, PAL/NTSC support and audio pairing depend on the actual dongle.
-- HDMI playback depends on DRM/KMS/mpv and hardware/display permissions; it is not guaranteed on every audio/display configuration.
+- HDMI playback depends on DRM/KMS/mpv and hardware/display permissions; it is not guaranteed on every audio/display configuration. It's also not intended for use as a live monitor view.
 - The application currently assumes a **single active capture workflow** and is not a multi-user web service.
 - Samba, USB automount, sudo permission for Reboot/Shut down and NetworkManager setup are **system administration tasks**; the Python script does not install or configure them automatically.
+- If the script terminates suddenly, **make sure your power supply is strong enough for all your accessories.**
 
 ## Attribution and publishing
 
