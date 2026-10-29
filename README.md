@@ -1,6 +1,6 @@
 # CamPi
 
-**A tapeless, touch-controlled DV/HDV and analogue-video recorder for Raspberry Pi 5.**
+**A tapeless, touch-controlled DV/HDV and analog video recording script for Raspberry Pi 5.**
 
 CamPi turns a Raspberry Pi 5 into a self-contained **direct-to-edit video capture unit** for DV/HDV camcorders, DV/HDV tape decks and analog sources (including analog camcorders). Instead of requiring a chain of devices and conversion steps, this **directly records a native FireWire DV/HDV stream (or a USB dongle-based analog capture feed) to an SD card or attached USB storage device**, then makes the resulting raw files available for editing or archiving.
 
