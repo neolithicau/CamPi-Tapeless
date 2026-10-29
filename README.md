@@ -1,13 +1,15 @@
 # CamPi
 
-**A tapeless, touch-controlled DV/HDV and analog video recording script for Raspberry Pi 5.**
+**A tapeless, touch-controlled DV/HDV and analog video recording interface for Raspberry Pi 5.**
 
 CamPi turns a Raspberry Pi 5 into a self-contained **direct-to-edit video capture unit** for DV/HDV camcorders, DV/HDV tape decks and analog sources (including analog camcorders). Instead of requiring a chain of devices and conversion steps, this **directly records a native FireWire DV/HDV stream (or a USB dongle-based analog capture feed) to an SD card or attached USB storage device**, then makes the resulting raw files available for editing or archiving.
 
+Designed for enthusiasts working with legacy camcorders and video equipment, CamPi is a DIY alternative for tapeless camcorder recording, H/DV transfer and digital video archiving. At the time of writing, all of the off-the-shelf options for tapeless camcorders do not interface with FireWire, and while there are several projects on the way in that space, I wanted one a bit quicker than that. Firewire was the original goal, and then I just kept expanding with additional features as outlined below.
+
 My original build uses a **Pi 5 1gb, Raspberry Pi OS Lite 64-bit, PCIe TO MiniPCIe Adapter, a Startech PCIe-to-FireWire card (MPEX1394B3), and a 320 × 240 SPI touchscreen (Aliexpress / SHCHV 2.4inch display)**, and a little 5v buzzer on GPIO 16 (optional) for audible confirmation of recording start/stop. My capture directories are also shared via SAMBA on any connected Wifi, but that's a seperate set of optional configs which is out of the scope of this script.
 
-> **Status: Everything works great (for me).**
-> DV and HDV FireWire capture and tapedeck functions, analog captures, touchscreen and HDMI recording playback have been tested at length on my Pi5 1gb setup. I have tested this with various Amazon el-cheapo analog video adapters, and tested various types of MiniDV and HDV cameras on the StarTech firewire adapter (MiniDV PAL, MiniDV NTSC and HDV units all tested). This script is **not validated across multiple Pi 5 environments or setups**. Again, if your ultra specific device or unique setup doesn't work, please don't be surprised. You should see easy success if you replicate my off-the-shelf environment described above.
+> **Details of testing:**
+> DV and HDV FireWire capture and tapedeck functions, analog captures, touchscreen and HDMI recording playback have been tested at length on my setup. I tested various Amazon el-cheapo analog video adapters, and various types of MiniDV and HDV cameras on the StarTech firewire adapter (MiniDV PAL, MiniDV NTSC and HDV units - all working great). You should see easy success with this script if you replicate my off-the-shelf environment as described above.
 
 **NOTE:** Follow [INSTALL.md](INSTALL.md) and check the [limitations](#limitations-and-compatibility). This script is provided with absolutely zero support or warranty. I do not guarantee it will work in any instance outside my own operating environment and the prescribed hardware list, but I have produced it with some redundancy and fallbacks to allow it to operate in any similar environment. 
 
